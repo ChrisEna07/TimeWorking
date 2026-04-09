@@ -1,0 +1,63 @@
+name: timeworking
+description: "App para gestión de tiempos y pagos - TimeWorking by ChrizDev"
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Iconos oficiales
+  cupertino_icons: ^1.0.8
+
+  # --- GESTIÓN DE DATOS Y ESTADO ---
+  # Para guardar los tiempos de inicio y fin localmente (que no se pierdan al cerrar)
+  get_storage: ^2.1.1
+  
+  # Conexión con la base de datos y autenticación
+  supabase_flutter: ^2.0.2
+  # --- LÓGICA DE TIEMPO Y MONEDA ---
+  # Fundamental para calcular horas, días de la semana y formatear a Pesos Colombianos
+  intl: ^0.19.0
+
+  # --- GENERACIÓN DE REPORTES PDF ---
+  # Necesarios para crear y compartir el reporte para el capataz
+  pdf: ^3.10.8
+  printing: ^5.11.1
+  path_provider: ^2.1.2
+
+  # --- DISEÑO PROFESIONAL ---
+  # Fuentes modernas y animaciones de carga
+  google_fonts: ^6.2.1
+  flutter_spinkit: ^5.2.1
+  local_auth: ^2.2.0
+  url_launcher: ^6.2.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  # Recomendaciones de código limpio
+  flutter_lints: ^3.0.0
+  flutter_launcher_icons: ^0.13.1
+
+flutter_launcher_icons:
+  android: "launcher_icon"
+  ios: true
+  image_path: "assets/app_icon.png"
+  min_sdk_android: 21
+
+flutter:
+  uses-material-design: true
+
+  # Si decides usar un logo propio, asegúrate de crear la carpeta assets/images 
+  # y descomentar las líneas de abajo:
+  # assets:
+  #   - assets/images/logo_chrizdev.png
+
+  # Google Fonts se encarga de las fuentes automáticamente vía HTTP, 
+  # pero si quieres fuentes offline se declararían aquí.
