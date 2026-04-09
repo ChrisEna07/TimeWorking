@@ -44,12 +44,20 @@ dev_dependencies:
   # Recomendaciones de código limpio
   flutter_lints: ^3.0.0
   flutter_launcher_icons: ^0.13.1
+  flutter_native_splash: ^2.4.0
 
 flutter_launcher_icons:
   android: "launcher_icon"
   ios: true
   image_path: "assets/app_icon.png"
   min_sdk_android: 21
+
+flutter_native_splash:
+  color: "#0F1B14"
+  image: "assets/app_icon.png"
+  android: true
+  ios: true
+  web: false
 
 flutter:
   uses-material-design: true
