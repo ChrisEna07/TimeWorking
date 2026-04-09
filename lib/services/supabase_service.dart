@@ -1,28 +1,29 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../models/work_log.dart';
+import '../config/app_config.dart';
 
 class SupabaseService {
-  final SupabaseClient client = Supabase.instance.client;
-
-  // Singleton pattern
   static final SupabaseService _instance = SupabaseService._internal();
   factory SupabaseService() => _instance;
   SupabaseService._internal();
 
-  String? get currentUserId => client.auth.currentUser?.id;
-  String get currentUserName => client.auth.currentUser?.userMetadata?['display_name'] ?? 'Usuario';
-  bool get isAuthenticated => client.auth.currentUser != null;
+  final client = Supabase.instance.client;
 
-  Future<AuthResponse> signUp(String email, String password, String name) async {
-    return await client.auth.signUp(
-      email: email,
-      password: password,
-      data: {'display_name': name},
-    );
+  User? get currentUser => client.auth.currentUser;
+  String? get currentUserId => currentUser?.id;
+  String get currentUserName => currentUser?.userMetadata?['name'] ?? 'Usuario';
+  bool get isAuthenticated => currentUser != null;
+
+  Future<void> signIn(String email, String password) async {
+    await client.auth.signInWithPassword(email: email, password: password);
   }
 
-  Future<AuthResponse> signIn(String email, String password) async {
-    return await client.auth.signInWithPassword(email: email, password: password);
+  Future<void> signUp(String email, String password, String name) async {
+    await client.auth.signUp(
+      email: email, 
+      password: password,
+      data: {'name': name},
+    );
   }
 
   Future<void> signOut() async {
@@ -33,13 +34,12 @@ class SupabaseService {
     await client.auth.resetPasswordForEmail(email);
   }
 
-  // Record start time
   Future<WorkLog> startShift() async {
     final now = DateTime.now();
     final isSaturday = now.weekday == DateTime.saturday;
     
     final newLog = WorkLog(
-      userId: currentUserId, // Use the correct nullable ID
+      userId: currentUserId,
       startTime: now,
       isSaturday: isSaturday,
     );
@@ -53,17 +53,17 @@ class SupabaseService {
     return WorkLog.fromJson(response);
   }
 
-  // Record end time
   Future<WorkLog> endShift(String logId, DateTime startTime) async {
     final now = DateTime.now();
-    final duration = now.difference(startTime);
-    final hours = duration.inMinutes / 60.0;
-
+    
+    // Get current log to get break duration
+    final currentResponse = await client.from('work_logs').select().eq('id', logId).single();
+    final currentLog = WorkLog.fromJson(currentResponse);
+    
     final response = await client
         .from('work_logs')
         .update({
-          'end_time': now.toIso8601String(),
-          'total_hours': hours,
+          'end_time': now.toUtc().toIso8601String(),
         })
         .eq('id', logId)
         .select()
@@ -72,50 +72,73 @@ class SupabaseService {
     return WorkLog.fromJson(response);
   }
 
-  // Get active shift (if any)
+  Future<void> togglePause(String logId, bool isPausing) async {
+    final now = DateTime.now();
+    if (isPausing) {
+      // Start break
+      await client.from('work_logs').update({
+        'break_start_time': now.toUtc().toIso8601String(),
+      }).eq('id', logId);
+    } else {
+      // Resume from break - Calculate gap
+      final response = await client.from('work_logs').select('break_start_time, break_duration').eq('id', logId).single();
+      final breakStart = DateTime.parse(response['break_start_time']).toLocal();
+      final currentBreakDuration = response['break_duration'] ?? 0;
+      
+      final addedMinutes = now.difference(breakStart).inMinutes;
+      
+      await client.from('work_logs').update({
+        'break_start_time': null,
+        'break_duration': currentBreakDuration + addedMinutes,
+      }).eq('id', logId);
+    }
+  }
+
   Future<WorkLog?> getActiveShift() async {
+    final userId = currentUserId;
+    if (userId == null) return null;
+
     final response = await client
         .from('work_logs')
         .select()
-        .filter('end_time', 'is', null)
+        .eq('user_id', userId)
+        .isFilter('end_time', null)
         .maybeSingle();
 
     if (response == null) return null;
     return WorkLog.fromJson(response);
   }
 
-  // Get logs for the current week context
+  Future<bool> isCurrentlyOnBreak(String logId) async {
+    final response = await client.from('work_logs').select('break_start_time').eq('id', logId).single();
+    return response['break_start_time'] != null;
+  }
+
   Future<List<WorkLog>> getUnpaidLogs() async {
+    final userId = currentUserId;
+    if (userId == null) return [];
+
     final response = await client
         .from('work_logs')
         .select()
+        .eq('user_id', userId)
         .eq('is_paid', false)
         .order('start_time', ascending: false);
 
     return (response as List).map((json) => WorkLog.fromJson(json)).toList();
   }
 
-  // Calculate current week's total (Excluding current Saturday)
   double calculatePayableTotal(List<WorkLog> logs) {
     double total = 0;
     final now = DateTime.now();
-    
-    // Find the start of the current week (Monday)
     final monday = now.subtract(Duration(days: now.weekday - 1));
     final startOfMonday = DateTime(monday.year, monday.month, monday.day);
 
     for (var log in logs) {
-      // If it's Saturday and it's from the CURRENT week, skip it (it goes to next week)
-      if (log.isSaturday && log.startTime.isAfter(startOfMonday)) {
-        continue;
-      }
+      if (log.isSaturday && log.startTime.isAfter(startOfMonday)) continue;
       total += log.totalHours;
     }
     return total;
-  }
-  
-  Future<void> markLogsAsPaid(List<String> ids) async {
-    await client.from('work_logs').update({'is_paid': true}).filter('id', 'in', ids);
   }
 
   Future<void> recordPayment({
@@ -127,10 +150,7 @@ class SupabaseService {
     final userId = currentUserId;
     if (userId == null) return;
 
-    // 1. Mark logs as paid
-    await markLogsAsPaid(logIds);
-
-    // 2. Create history entry
+    await client.from('work_logs').update({'is_paid': true}).filter('id', 'in', logIds);
     await client.from('payment_history').insert({
       'user_id': userId,
       'amount': amount,

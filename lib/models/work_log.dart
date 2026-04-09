@@ -1,22 +1,20 @@
-import 'package:intl/intl.dart';
-
 class WorkLog {
   final String? id;
   final String? userId;
   final DateTime startTime;
-  final DateTime? endTime;
-  final double totalHours;
+  DateTime? endTime;
   final bool isSaturday;
   final bool isPaid;
+  final int breakDuration; // In minutes
 
   WorkLog({
     this.id,
     this.userId,
     required this.startTime,
     this.endTime,
-    this.totalHours = 0.0,
     required this.isSaturday,
     this.isPaid = false,
+    this.breakDuration = 0,
   });
 
   factory WorkLog.fromJson(Map<String, dynamic> json) {
@@ -25,32 +23,28 @@ class WorkLog {
       userId: json['user_id'],
       startTime: DateTime.parse(json['start_time']).toLocal(),
       endTime: json['end_time'] != null ? DateTime.parse(json['end_time']).toLocal() : null,
-      totalHours: (json['total_hours'] as num? ?? 0.0).toDouble(),
       isSaturday: json['is_saturday'] ?? false,
       isPaid: json['is_paid'] ?? false,
+      breakDuration: json['break_duration'] ?? 0,
     );
   }
 
   Map<String, dynamic> toJson() {
     return {
-      if (id != null) 'id': id,
-      if (userId != null && userId!.isNotEmpty) 'user_id': userId,
+      if (userId != null) 'user_id': userId,
       'start_time': startTime.toUtc().toIso8601String(),
-      'end_time': endTime?.toUtc().toIso8601String(),
-      'total_hours': totalHours,
+      if (endTime != null) 'end_time': endTime!.toUtc().toIso8601String(),
       'is_saturday': isSaturday,
       'is_paid': isPaid,
+      'break_duration': breakDuration,
     };
   }
 
-  String get formattedDate => DateFormat('dd/MM/yyyy').format(startTime);
-  String get formattedStartTime => DateFormat('hh:mm a').format(startTime);
-  String get formattedEndTime => endTime != null ? DateFormat('hh:mm a').format(endTime!) : '--:--';
-  
-  double get earnings => totalHours * 6000;
-  
-  String get formattedEarnings {
-    final formatter = NumberFormat.currency(locale: 'es_CO', symbol: '\$', decimalDigits: 0);
-    return formatter.format(earnings);
+  double get totalHours {
+    if (endTime == null) return 0;
+    final diff = endTime!.difference(startTime);
+    final hours = diff.inMinutes / 60.0;
+    final netHours = hours - (breakDuration / 60.0);
+    return netHours > 0 ? netHours : 0;
   }
 }

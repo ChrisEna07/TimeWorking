@@ -7,6 +7,7 @@ import '../config/app_config.dart';
 import '../models/work_log.dart';
 import '../services/supabase_service.dart';
 import '../services/pdf_service.dart';
+import '../services/notification_service.dart';
 import 'login_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -18,9 +19,11 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   final _supabase = SupabaseService();
+  final _notif = NotificationService();
   WorkLog? _activeShift;
   List<WorkLog> _unpaidLogs = [];
   bool _isLoading = true;
+  bool _isOnBreak = false;
   Timer? _timer;
   String _currentDuration = "00:00:00";
   String _currentTime = "";
@@ -43,9 +46,14 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final active = await _supabase.getActiveShift();
       final logs = await _supabase.getUnpaidLogs();
+      bool onBreak = false;
+      if (active != null) {
+        onBreak = await _supabase.isCurrentlyOnBreak(active.id!);
+      }
       setState(() {
         _activeShift = active;
         _unpaidLogs = logs;
+        _isOnBreak = onBreak;
         _isLoading = false;
       });
       _refreshClocks();
@@ -61,14 +69,23 @@ class _HomeScreenState extends State<HomeScreen> {
       _currentTime = DateFormat('hh:mm:ss a').format(now);
     });
 
-    if (_activeShift != null) {
+    if (_activeShift != null && !_isOnBreak) {
       final diff = now.difference(_activeShift!.startTime);
-      final h = diff.inHours.toString().padLeft(2, '0');
-      final m = (diff.inMinutes % 60).toString().padLeft(2, '0');
-      final s = (diff.inSeconds % 60).toString().padLeft(2, '0');
+      // Subtract break duration (stored in activeShift model)
+      final netDiff = diff - Duration(minutes: _activeShift!.breakDuration);
+      
+      final h = netDiff.inHours;
+      final m = (netDiff.inMinutes % 60).toString().padLeft(2, '0');
+      final s = (netDiff.inSeconds % 60).toString().padLeft(2, '0');
+      
       setState(() {
-        _currentDuration = "$h:$m:$s";
+        _currentDuration = "${h.toString().padLeft(2, '0')}:$m:$s";
       });
+
+      // 12 HOUR ALERT
+      if (h == 12 && netDiff.inMinutes % 60 == 0 && netDiff.inSeconds % 60 == 0) {
+        _notif.showInstantNotification("¡Jornada de 12 horas!", "¿Deseas seguir trabajando o cerrar el día?");
+      }
     }
   }
 
@@ -76,17 +93,36 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final log = await _supabase.startShift();
       setState(() => _activeShift = log);
+      _notif.showInstantNotification("Jornada Iniciada", "El cronómetro está corriendo.");
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Error: $e")));
     }
   }
 
+  Future<void> _togglePause() async {
+    if (_activeShift == null) return;
+    try {
+      bool targetState = !_isOnBreak;
+      await _supabase.togglePause(_activeShift!.id!, targetState);
+      setState(() => _isOnBreak = targetState);
+      _loadData(); // To refresh break_duration
+      _notif.showInstantNotification(
+        targetState ? "Pausa Iniciada" : "Jornada Reanudada", 
+        targetState ? "El tiempo de almuerzo no se contará para el pago." : "El cronómetro vuelve a correr."
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Error en pausa: $e")));
+    }
+  }
+
   Future<void> _endShift() async {
     try {
+      if (_isOnBreak) await _togglePause(); // Ensure we end break before ending shift
       await _supabase.endShift(_activeShift!.id!, _activeShift!.startTime);
       setState(() {
         _activeShift = null;
         _currentDuration = "00:00:00";
+        _isOnBreak = false;
       });
       _loadData();
     } catch (e) {
@@ -151,8 +187,8 @@ class _HomeScreenState extends State<HomeScreen> {
                     contentPadding: EdgeInsets.zero,
                     title: Text(dateStr, style: GoogleFonts.outfit(fontWeight: FontWeight.w600, color: Colors.white)),
                     subtitle: Text(
-                      "${DateFormat('hh:mm a').format(log.startTime)} - ${log.endTime != null ? DateFormat('hh:mm a').format(log.endTime!) : 'En curso'}",
-                      style: const TextStyle(color: Colors.white54),
+                      "${DateFormat('hh:mm a').format(log.startTime)} - ${log.endTime != null ? DateFormat('hh:mm a').format(log.endTime!) : 'En curso'}\nPausa: ${log.breakDuration} min",
+                      style: const TextStyle(color: Colors.white54, fontSize: 11),
                     ),
                     trailing: Text("${log.totalHours.toStringAsFixed(1)} h", style: GoogleFonts.outfit(color: AppConfig.primaryGreen, fontWeight: FontWeight.bold)),
                   );
@@ -384,8 +420,13 @@ class _HomeScreenState extends State<HomeScreen> {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Text(
-                isWorking ? "EN JORNADA" : "SISTEMA LISTO",
-                style: GoogleFonts.outfit(color: isWorking ? AppConfig.primaryGreen : Colors.white24, fontWeight: FontWeight.bold, letterSpacing: 2, fontSize: 12),
+                isWorking ? (_isOnBreak ? "EN PAUSA (ALMUERZO)" : "EN JORNADA") : "SISTEMA LISTO",
+                style: GoogleFonts.outfit(
+                  color: _isOnBreak ? AppConfig.gold : (isWorking ? AppConfig.primaryGreen : Colors.white24), 
+                  fontWeight: FontWeight.bold, 
+                  letterSpacing: 2, 
+                  fontSize: 12
+                ),
               ),
               Text(_currentTime, style: GoogleFonts.outfit(color: Colors.white54, fontSize: 12)),
             ],
@@ -393,25 +434,61 @@ class _HomeScreenState extends State<HomeScreen> {
           const SizedBox(height: 30),
           Text(
             _currentDuration,
-            style: GoogleFonts.orbitron(fontSize: 48, fontWeight: FontWeight.bold, color: Colors.white, letterSpacing: 2),
-          ),
-          const SizedBox(height: 40),
-          SizedBox(
-            width: double.infinity,
-            height: 65,
-            child: ElevatedButton(
-              onPressed: isWorking ? _endShift : _startShift,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: isWorking ? Colors.redAccent.withOpacity(0.8) : AppConfig.primaryGreen,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-                elevation: 0,
-              ),
-              child: Text(
-                isWorking ? "FINALIZAR JORNADA" : "INICIAR JORNADA",
-                style: const TextStyle(fontWeight: FontWeight.w900, letterSpacing: 2, color: Colors.white),
-              ),
+            style: GoogleFonts.orbitron(
+              fontSize: 48, 
+              fontWeight: FontWeight.bold, 
+              color: _isOnBreak ? Colors.white60 : Colors.white, 
+              letterSpacing: 2
             ),
           ),
+          const SizedBox(height: 40),
+          if (isWorking) 
+            Row(
+              children: [
+                Expanded(
+                  child: SizedBox(
+                    height: 60,
+                    child: ElevatedButton.icon(
+                      onPressed: _togglePause,
+                      icon: Icon(_isOnBreak ? Icons.play_arrow : Icons.pause),
+                      label: Text(_isOnBreak ? "REANUDAR" : "ALMUERZO"),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: _isOnBreak ? AppConfig.primaryGreen : AppConfig.gold.withOpacity(0.8),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: SizedBox(
+                    height: 60,
+                    child: ElevatedButton.icon(
+                      onPressed: _endShift,
+                      icon: const Icon(Icons.stop),
+                      label: const Text("PARAR"),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.redAccent.withOpacity(0.8),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            )
+          else 
+            SizedBox(
+              width: double.infinity,
+              height: 65,
+              child: ElevatedButton(
+                onPressed: _startShift,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppConfig.primaryGreen,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                ),
+                child: const Text("INICIAR JORNADA", style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 2, color: Colors.white)),
+              ),
+            ),
         ],
       ),
     );
@@ -442,7 +519,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 style: GoogleFonts.outfit(fontSize: 26, fontWeight: FontWeight.bold, color: Colors.white),
               ),
               const SizedBox(height: 5),
-              Text("(Excluye sábado actual)", style: GoogleFonts.outfit(fontSize: 10, color: AppConfig.primaryGreen.withOpacity(0.6))),
+              Text("(Total horas netas)", style: GoogleFonts.outfit(fontSize: 10, color: AppConfig.primaryGreen.withOpacity(0.6))),
             ],
           ),
           Container(
