@@ -6,7 +6,7 @@ import '../models/work_log.dart';
 import '../config/app_config.dart';
 
 class PdfService {
-  static Future<void> generateAndShareReport(List<WorkLog> logs, double totalPayable) async {
+  static Future<void> generateAndShareReport(List<WorkLog> logs, double totalPayable, double hourlyRate) async {
     final pdf = pw.Document();
     
     final currencyFormatter = NumberFormat.currency(locale: 'es_CO', symbol: '\$', decimalDigits: 0);
@@ -50,12 +50,32 @@ class PdfService {
                 log.formattedStartTime,
                 log.formattedEndTime,
                 log.totalHours.toStringAsFixed(2),
-                currencyFormatter.format(log.earnings),
+                currencyFormatter.format(log.totalHours * hourlyRate),
               ];
             }).toList(),
           ),
           
           pw.SizedBox(height: 30),
+          pw.Container(
+            padding: const pw.EdgeInsets.all(10),
+            decoration: const pw.BoxDecoration(
+              color: PdfColors.grey100,
+              borderRadius: pw.BorderRadius.all(pw.Radius.circular(5)),
+            ),
+            child: pw.Column(
+              crossAxisAlignment: pw.CrossAxisAlignment.start,
+              children: [
+                pw.Text('Fórmula de Cálculo Preciso:', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10)),
+                pw.Text('1. Bruto: (Hora de Salida - Hora de Entrada)', style: const pw.TextStyle(fontSize: 9)),
+                pw.Text('2. Neto: (Tiempo Bruto - Minutos de Almuerzo)', style: const pw.TextStyle(fontSize: 9)),
+                pw.Text('3. Pago: (Horas Netas x ${currencyFormatter.format(hourlyRate)})', style: const pw.TextStyle(fontSize: 9)),
+                pw.Text('* Los cálculos se realizan con precisión de segundos para asegurar que cada minuto trabajado sea pagado exactamente.', 
+                  style: pw.TextStyle(fontSize: 8, fontStyle: pw.FontStyle.italic, color: PdfColors.grey700)),
+              ],
+            ),
+          ),
+          
+          pw.SizedBox(height: 20),
           pw.Align(
             alignment: pw.Alignment.centerRight,
             child: pw.Container(
@@ -68,7 +88,7 @@ class PdfService {
                 crossAxisAlignment: pw.CrossAxisAlignment.end,
                 children: [
                   pw.Text('TOTAL A PAGAR ESTE SEMANA:', style: pw.TextStyle(fontSize: 12, fontWeight: pw.FontWeight.bold)),
-                  pw.Text(currencyFormatter.format(totalPayable * AppConfig.hourlyRate), style: pw.TextStyle(fontSize: 20, fontWeight: pw.FontWeight.bold, color: PdfColors.green900)),
+                  pw.Text(currencyFormatter.format(totalPayable * hourlyRate), style: pw.TextStyle(fontSize: 20, fontWeight: pw.FontWeight.bold, color: PdfColors.green900)),
                   pw.Text('(Excluye sábado de esta semana)', style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey600)),
                 ],
               ),

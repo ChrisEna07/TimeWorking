@@ -18,7 +18,7 @@ class NotificationService {
       // Fallback if Colombia zone is not found (unlikely)
     }
 
-    const AndroidInitializationSettings initializationSettingsAndroid = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const AndroidInitializationSettings initializationSettingsAndroid = AndroidInitializationSettings('@mipmap/launcher_icon');
     const InitializationSettings initializationSettings = InitializationSettings(android: initializationSettingsAndroid);
     await flutterLocalNotificationsPlugin.initialize(initializationSettings);
 

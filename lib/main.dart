@@ -54,7 +54,7 @@ class MyApp extends StatelessWidget {
       title: 'TimeWorking',
       debugShowCheckedModeBanner: false,
       theme: AppConfig.theme,
-      home: supabase.isAuthenticated ? const HomeScreen() : const LoginScreen(),
+      home: supabase.isAuthenticated ? HomeScreen() : const LoginScreen(),
     );
   }
 }

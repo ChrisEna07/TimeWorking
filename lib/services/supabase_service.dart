@@ -45,6 +45,43 @@ class SupabaseService {
     await client.auth.resetPasswordForEmail(email);
   }
 
+  Future<void> updateWorkLog({
+    required String logId,
+    required DateTime startTime,
+    required DateTime endTime,
+    required int breakDuration,
+  }) async {
+    await client.from('work_logs').update({
+      'start_time': startTime.toUtc().toIso8601String(),
+      'end_time': endTime.toUtc().toIso8601String(),
+      'break_duration': breakDuration,
+    }).eq('id', logId);
+  }
+
+  Future<WorkLog> addManualLog({
+    required DateTime startTime,
+    required DateTime endTime,
+    required int breakDuration,
+  }) async {
+    final isSaturday = startTime.weekday == DateTime.saturday;
+    
+    final newLog = WorkLog(
+      userId: currentUserId,
+      startTime: startTime,
+      endTime: endTime,
+      isSaturday: isSaturday,
+      breakDuration: breakDuration,
+    );
+
+    final response = await client
+        .from('work_logs')
+        .insert(newLog.toJson())
+        .select()
+        .single();
+
+    return WorkLog.fromJson(response);
+  }
+
   Future<WorkLog> startShift() async {
     final now = DateTime.now();
     final isSaturday = now.weekday == DateTime.saturday;
@@ -158,6 +195,26 @@ class SupabaseService {
       total += log.totalHours;
     }
     return total;
+  }
+
+  Future<void> recordSinglePayment({
+    required String logId,
+    required double amount,
+    required double hours,
+    required String notes,
+  }) async {
+    final userId = currentUserId;
+    if (userId == null) return;
+
+    await client.from('work_logs').update({'is_paid': true}).eq('id', logId);
+    await client.from('payment_history').insert({
+      'user_id': userId,
+      'amount': amount,
+      'total_hours': hours,
+      'notes': notes,
+      'work_log_ids': [logId],
+      'payment_date': DateTime.now().toIso8601String(),
+    });
   }
 
   Future<void> recordPayment({

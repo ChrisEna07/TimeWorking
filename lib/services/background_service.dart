@@ -54,8 +54,16 @@ class AppBackgroundService {
   static void onStart(ServiceInstance service) async {
     DartPluginRegistrant.ensureInitialized();
 
-    final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
-        FlutterLocalNotificationsPlugin();
+    final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin = FlutterLocalNotificationsPlugin();
+    
+    // IMPORTANT: Initialize notifications for the record isolate
+    const AndroidInitializationSettings initializationSettingsAndroid = AndroidInitializationSettings('@mipmap/launcher_icon');
+    const InitializationSettings initializationSettings = InitializationSettings(android: initializationSettingsAndroid);
+    await flutterLocalNotificationsPlugin.initialize(initializationSettings);
+
+    if (service is AndroidServiceInstance) {
+      service.setAsForegroundService();
+    }
 
     service.on('stopService').listen((event) {
       service.stopSelf();
@@ -63,9 +71,11 @@ class AppBackgroundService {
 
     // Update timer every second
     Timer.periodic(const Duration(seconds: 1), (timer) async {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.reload(); // Ensure we get fresh data from main isolate
+      
       if (service is AndroidServiceInstance) {
         if (await service.isForegroundService()) {
-          final prefs = await SharedPreferences.getInstance();
           final startTimeStr = prefs.getString('active_start_time');
           final breakDuration = prefs.getInt('active_break_duration') ?? 0;
           final isOnBreak = prefs.getBool('is_on_break') ?? false;
@@ -85,7 +95,7 @@ class AppBackgroundService {
                   android: AndroidNotificationDetails(
                     notificationChannelId,
                     'Contador de Jornada',
-                    icon: '@mipmap/ic_launcher',
+                    icon: '@mipmap/launcher_icon',
                     ongoing: true,
                     importance: Importance.low,
                     priority: Priority.low,
@@ -107,7 +117,7 @@ class AppBackgroundService {
                   android: AndroidNotificationDetails(
                     notificationChannelId,
                     'Contador de Jornada',
-                    icon: '@mipmap/ic_launcher',
+                    icon: '@mipmap/launcher_icon',
                     ongoing: true,
                     importance: Importance.low,
                     priority: Priority.low,
