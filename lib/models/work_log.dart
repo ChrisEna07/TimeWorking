@@ -1,3 +1,6 @@
+import 'package:intl/intl.dart';
+import '../config/app_config.dart';
+
 class WorkLog {
   final String? id;
   final String? userId;
@@ -43,8 +46,15 @@ class WorkLog {
   double get totalHours {
     if (endTime == null) return 0;
     final diff = endTime!.difference(startTime);
-    final hours = diff.inMinutes / 60.0;
+    // Use seconds for maximum precision (1 minute = 60s)
+    final hours = diff.inSeconds / 3600.0;
     final netHours = hours - (breakDuration / 60.0);
     return netHours > 0 ? netHours : 0;
   }
+
+  // Getters for PDF and UI
+  String get formattedDate => DateFormat('dd/MM/yyyy').format(startTime);
+  String get formattedStartTime => DateFormat('hh:mm a').format(startTime);
+  String get formattedEndTime => endTime != null ? DateFormat('hh:mm a').format(endTime!) : '--:--';
+  double get earnings => totalHours * AppConfig.hourlyRate;
 }

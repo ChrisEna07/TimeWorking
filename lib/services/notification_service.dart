@@ -11,9 +11,21 @@ class NotificationService {
 
   Future<void> init() async {
     tz.initializeTimeZones();
+    // Set local location to Colombia for consistent scheduling
+    try {
+      tz.setLocalLocation(tz.getLocation('America/Bogota'));
+    } catch (e) {
+      // Fallback if Colombia zone is not found (unlikely)
+    }
+
     const AndroidInitializationSettings initializationSettingsAndroid = AndroidInitializationSettings('@mipmap/ic_launcher');
     const InitializationSettings initializationSettings = InitializationSettings(android: initializationSettingsAndroid);
     await flutterLocalNotificationsPlugin.initialize(initializationSettings);
+
+    // Request permissions for Android 13+
+    await flutterLocalNotificationsPlugin
+        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+        ?.requestNotificationsPermission();
   }
 
   Future<void> scheduleWorkReminders() async {

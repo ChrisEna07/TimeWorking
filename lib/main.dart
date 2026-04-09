@@ -8,45 +8,53 @@ import 'screens/home_screen.dart';
 import 'screens/login_screen.dart';
 import 'services/supabase_service.dart';
 import 'services/notification_service.dart';
+import 'services/background_service.dart';
 
 void main() async {
   WidgetsBinding widgetsBinding = WidgetsFlutterBinding.ensureInitialized();
   FlutterNativeSplash.preserve(widgetsBinding: widgetsBinding);
   
-  // Initialize Notifications
-  final notifService = NotificationService();
-  await notifService.init();
-  await notifService.scheduleWorkReminders();
+  try {
+    // 1. Core initializations
+    await initializeDateFormatting('es', null);
+    await GetStorage.init();
+    
+    // 2. Initialize Supabase
+    await Supabase.initialize(
+      url: AppConfig.supabaseUrl,
+      anonKey: AppConfig.supabaseAnonKey,
+    );
 
-  await initializeDateFormatting('es', null);
-  await GetStorage.init();
-  
-  // Wait 5 seconds to show the logo
-  await Future.delayed(const Duration(seconds: 5));
-  FlutterNativeSplash.remove();
-  
-  // Initialize Supabase
-  await Supabase.initialize(
-    url: AppConfig.supabaseUrl,
-    anonKey: AppConfig.supabaseAnonKey,
-  );
+    // 3. Initialize Notifications & Background Service
+    final notifService = NotificationService();
+    await notifService.init();
+    await notifService.scheduleWorkReminders();
+    await AppBackgroundService.initialize();
 
-  runApp(const TimeWorkingApp());
+    // 4. Forced delay for logo visibility (Optional, set to 3s for better UX)
+    await Future.delayed(const Duration(seconds: 3));
+
+  } catch (e) {
+    debugPrint("Initialization error: $e");
+  } finally {
+    // Always remove splash even if error occurs
+    FlutterNativeSplash.remove();
+  }
+  
+  runApp(const MyApp());
 }
 
-class TimeWorkingApp extends StatelessWidget {
-  const TimeWorkingApp({super.key});
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    // Check if user is already logged in
-    final bool isLogged = SupabaseService().isAuthenticated;
-
+    final supabase = SupabaseService();
     return MaterialApp(
+      title: 'TimeWorking',
       debugShowCheckedModeBanner: false,
-      title: 'TimeWorking by ChrizDev',
       theme: AppConfig.theme,
-      home: isLogged ? const HomeScreen() : const LoginScreen(),
+      home: supabase.isAuthenticated ? const HomeScreen() : const LoginScreen(),
     );
   }
 }
