@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../config/app_config.dart';
-import '../services/supabase_service.dart';
+import '../services/local_db_service.dart';
 import 'home_screen.dart';
 import 'register_screen.dart';
 
@@ -16,7 +16,7 @@ class LoginScreen extends StatefulWidget {
 class _LoginScreenState extends State<LoginScreen> {
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
-  final _supabase = SupabaseService();
+  final _db = LocalDbService();
   bool _isLoading = false;
 
   Future<void> _handleLogin() async {
@@ -29,14 +29,14 @@ class _LoginScreenState extends State<LoginScreen> {
 
     setState(() => _isLoading = true);
     try {
-      await _supabase.signIn(
+      await _db.signIn(
         _emailController.text.trim(),
         _passwordController.text.trim(),
       );
       if (!mounted) return;
       Navigator.pushReplacement(
         context,
-        MaterialPageRoute(builder: (context) => HomeScreen()),
+        MaterialPageRoute(builder: (context) => const HomeScreen()),
       );
     } catch (e) {
       if (!mounted) return;
@@ -178,6 +178,24 @@ class _LoginScreenState extends State<LoginScreen> {
                     ),
                   ),
                 ],
+              ),
+              const SizedBox(height: 20),
+              GestureDetector(
+                onTap: () async {
+                  final url = "https://christian-romero.vercel.app/index.html";
+                  if (await canLaunchUrl(Uri.parse(url))) {
+                    await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+                  }
+                },
+                child: Text(
+                  "by ChrizDev",
+                  style: GoogleFonts.outfit(
+                    color: Colors.white38,
+                    fontSize: 12,
+                    decoration: TextDecoration.underline,
+                    letterSpacing: 1,
+                  ),
+                ),
               ),
             ],
           ),

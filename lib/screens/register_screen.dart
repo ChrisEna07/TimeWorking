@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../config/app_config.dart';
-import '../services/supabase_service.dart';
+import '../services/local_db_service.dart';
 
 class RegisterScreen extends StatefulWidget {
   const RegisterScreen({super.key});
@@ -14,17 +14,13 @@ class _RegisterScreenState extends State<RegisterScreen> {
   final _nameController = TextEditingController();
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
-  final _adminKeyController = TextEditingController();
-  final _supabase = SupabaseService();
+  final _db = LocalDbService();
   bool _isLoading = false;
-
-  final String _correctAdminKey = "ChrizDev073008";
 
   Future<void> _handleRegister() async {
     if (_nameController.text.isEmpty || 
         _emailController.text.isEmpty || 
-        _passwordController.text.isEmpty || 
-        _adminKeyController.text.isEmpty) {
+        _passwordController.text.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text("Por favor llena todos los campos")),
       );
@@ -41,19 +37,9 @@ class _RegisterScreenState extends State<RegisterScreen> {
       return;
     }
 
-    if (_adminKeyController.text.trim() != _correctAdminKey) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text("¡Clave de Admin Incorrecta! Solo ChrizDev puede crear cuentas."),
-          backgroundColor: Colors.red,
-        ),
-      );
-      return;
-    }
-
     setState(() => _isLoading = true);
     try {
-      await _supabase.signUp(
+      await _db.signUp(
         _emailController.text.trim(),
         _passwordController.text.trim(),
         _nameController.text.trim(),
@@ -77,7 +63,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
               ),
               const SizedBox(height: 10),
               Text(
-                "Santiago y tú ya pueden usar la app. No olvides desactivar 'Confirm Email' en Supabase.",
+                "Tu cuenta ha sido creada localmente con éxito. Ya puedes ingresar al sistema.",
                 textAlign: TextAlign.center,
                 style: GoogleFonts.outfit(),
               ),
@@ -122,7 +108,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
               ),
               const SizedBox(height: 10),
               Text(
-                "Solo el administrador puede crear cuentas",
+                "Crea un nuevo usuario local para trabajar",
                 style: GoogleFonts.outfit(color: Colors.grey),
               ),
               const SizedBox(height: 30),
@@ -151,22 +137,6 @@ class _RegisterScreenState extends State<RegisterScreen> {
                   prefixIcon: const Icon(Icons.lock_outline),
                   labelText: "Contraseña",
                   border: OutlineInputBorder(borderRadius: BorderRadius.circular(15)),
-                ),
-              ),
-              const SizedBox(height: 20),
-              const Divider(),
-              const SizedBox(height: 20),
-              TextField(
-                controller: _adminKeyController,
-                obscureText: true,
-                decoration: InputDecoration(
-                  prefixIcon: const Icon(Icons.admin_panel_settings, color: Colors.amber),
-                  labelText: "CLAVE ADMIN (ChrizDev)",
-                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(15)),
-                  focusedBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(15),
-                    borderSide: const BorderSide(color: Colors.amber, width: 2),
-                  ),
                 ),
               ),
               const SizedBox(height: 30),

@@ -19,8 +19,6 @@ dependencies:
   get_storage: ^2.1.1
   shared_preferences: ^2.2.2
   
-  # Conexión con la base de datos y autenticación
-  supabase_flutter: ^2.0.2
   # --- LÓGICA DE TIEMPO Y MONEDA ---
   # Fundamental para calcular horas, días de la semana y formatear a Pesos Colombianos
   intl: ^0.19.0

@@ -7,10 +7,6 @@ class AppConfig {
   static const String adminPhone = '573183517802';
   static const double hourlyRate = 6000.0;
 
-  // Supabase Config (USER should replace these)
-  static const String supabaseUrl = 'https://kkzpvlabdxalinhvvxsx.supabase.co';
-  static const String supabaseAnonKey = 'sb_publishable_6hJfBBswU-ScsbSVGljMEQ_cZ5GPxIS';
-
   // Colors - Premium Nature Theme
   static const Color primaryGreen = Color(0xFF1E5631);
   static const Color accentGreen = Color(0xFFA4DE02);

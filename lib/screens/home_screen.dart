@@ -8,10 +8,11 @@ import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../config/app_config.dart';
 import '../models/work_log.dart';
-import '../services/supabase_service.dart';
+import '../services/local_db_service.dart';
 import '../services/pdf_service.dart';
 import '../services/notification_service.dart';
 import 'login_screen.dart';
+
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
@@ -20,7 +21,7 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  final _supabase = SupabaseService();
+  final _db = LocalDbService();
   final _notif = NotificationService();
   List<WorkLog> _unpaidLogs = [];
   bool _isLoading = true;
@@ -28,10 +29,19 @@ class _HomeScreenState extends State<HomeScreen> {
   double _customHourlyRate = AppConfig.hourlyRate;
   List<Map<String, dynamic>> _paymentHistory = [];
 
+  // Manual Log Controllers & State
   DateTime _selectedDate = DateTime.now();
   TimeOfDay _startTime = TimeOfDay.now();
   TimeOfDay _endTime = TimeOfDay.now();
   final _breakController = TextEditingController(text: "0");
+  final _customHoursController = TextEditingController(text: "8.0");
+  String _workMode = 'hours'; // 'hours', 'shift_8', 'shift_12', 'custom'
+
+  // Real-Time shift stopwatch state
+  WorkLog? _activeShift;
+  bool _isOnBreak = false;
+  Duration _elapsedTime = Duration.zero;
+  Timer? _stopwatchTimer;
 
   @override
   void initState() {
@@ -39,6 +49,22 @@ class _HomeScreenState extends State<HomeScreen> {
     _requestPermissions();
     _loadCustomRate();
     _loadData();
+    _checkActiveShift();
+
+    // Listen to background service events to keep UI in sync
+    FlutterBackgroundService().on('update').listen((event) {
+      if (mounted) {
+        _checkActiveShift();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _stopwatchTimer?.cancel();
+    _breakController.dispose();
+    _customHoursController.dispose();
+    super.dispose();
   }
 
   Future<void> _loadCustomRate() async {
@@ -55,41 +81,31 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _requestPermissions() async {
-    // Request notification permission
     Map<Permission, PermissionStatus> statuses = await [
       Permission.notification,
       Permission.scheduleExactAlarm,
     ].request();
 
-    // Check if notification is granted
     if (statuses[Permission.notification] != PermissionStatus.granted) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text(
-              "Por favor activa las notificaciones para el cronómetro.",
-            ),
+            content: Text("Por favor activa las notificaciones para el cronómetro."),
           ),
         );
       }
     }
 
-    // Battery optimization is tricky but helpful for background service
     if (await Permission.ignoreBatteryOptimizations.isDenied) {
       await Permission.ignoreBatteryOptimizations.request();
     }
   }
 
-  @override
-  void dispose() {
-    super.dispose();
-  }
-
   Future<void> _loadData() async {
     setState(() => _isLoading = true);
     try {
-      final logs = await _supabase.getUnpaidLogs();
-      final history = await _supabase.getPaymentHistory();
+      final logs = await _db.getUnpaidLogs();
+      final history = await _db.getPaymentHistory();
       setState(() {
         _unpaidLogs = logs;
         _paymentHistory = history;
@@ -99,6 +115,64 @@ class _HomeScreenState extends State<HomeScreen> {
       debugPrint("Error loading data: $e");
       setState(() => _isLoading = false);
     }
+  }
+
+  Future<void> _checkActiveShift() async {
+    final active = await _db.getActiveShift();
+    final isOnBreak = active != null ? await _db.isCurrentlyOnBreak(active.id!) : false;
+    
+    if (active != null) {
+      if (_stopwatchTimer == null) {
+        _startStopwatchTimer(active.startTime, active.breakDuration, isOnBreak);
+      }
+    } else {
+      _stopwatchTimer?.cancel();
+      _stopwatchTimer = null;
+    }
+
+    if (mounted) {
+      setState(() {
+        _activeShift = active;
+        _isOnBreak = isOnBreak;
+      });
+    }
+  }
+
+  void _startStopwatchTimer(DateTime startTime, int breakDurationMinutes, bool isOnBreak) {
+    _stopwatchTimer?.cancel();
+    _stopwatchTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
+      if (!mounted) return;
+      if (_activeShift == null) {
+        timer.cancel();
+        _stopwatchTimer = null;
+        return;
+      }
+
+      final now = DateTime.now();
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.reload();
+
+      final currentIsOnBreak = prefs.getBool('is_on_break') ?? isOnBreak;
+      final currentBreakDuration = prefs.getInt('active_break_duration') ?? breakDurationMinutes;
+
+      Duration elapsed;
+      if (currentIsOnBreak) {
+        final breakStartStr = prefs.getString('active_break_start_time');
+        if (breakStartStr != null) {
+          final breakStart = DateTime.parse(breakStartStr).toLocal();
+          elapsed = breakStart.difference(startTime) - Duration(minutes: currentBreakDuration);
+        } else {
+          elapsed = now.difference(startTime) - Duration(minutes: currentBreakDuration);
+        }
+      } else {
+        elapsed = now.difference(startTime) - Duration(minutes: currentBreakDuration);
+      }
+
+      setState(() {
+        _elapsedTime = elapsed < Duration.zero ? Duration.zero : elapsed;
+        _isOnBreak = currentIsOnBreak;
+      });
+    });
   }
 
   Future<void> _selectDate() async {
@@ -128,20 +202,40 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _saveManualLog() async {
-    final start = DateTime(_selectedDate.year, _selectedDate.month, _selectedDate.day, _startTime.hour, _startTime.minute);
-    final end = DateTime(_selectedDate.year, _selectedDate.month, _selectedDate.day, _endTime.hour, _endTime.minute);
-    
-    if (end.isBefore(start)) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("La hora de salida debe ser después de la de entrada")));
-      return;
+    DateTime start;
+    DateTime end;
+    int breakDur = 0;
+    double? customHours;
+
+    if (_workMode == 'hours') {
+      start = DateTime(_selectedDate.year, _selectedDate.month, _selectedDate.day, _startTime.hour, _startTime.minute);
+      end = DateTime(_selectedDate.year, _selectedDate.month, _selectedDate.day, _endTime.hour, _endTime.minute);
+      breakDur = int.tryParse(_breakController.text) ?? 0;
+      
+      if (end.isBefore(start)) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("La hora de salida debe ser después de la de entrada")));
+        return;
+      }
+    } else {
+      start = DateTime(_selectedDate.year, _selectedDate.month, _selectedDate.day, 8, 0); // 8:00 AM standard start
+      if (_workMode == 'shift_8') {
+        end = start.add(const Duration(hours: 8));
+      } else if (_workMode == 'shift_12') {
+        end = start.add(const Duration(hours: 12));
+      } else {
+        customHours = double.tryParse(_customHoursController.text) ?? 8.0;
+        end = start.add(Duration(minutes: (customHours * 60).toInt()));
+      }
     }
 
     setState(() => _isLoading = true);
     try {
-      await _supabase.addManualLog(
+      await _db.addManualLog(
         startTime: start,
         endTime: end,
-        breakDuration: int.tryParse(_breakController.text) ?? 0,
+        breakDuration: breakDur,
+        workMode: _workMode,
+        customHours: customHours,
       );
       _loadData();
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Jornada Guardada")));
@@ -152,25 +246,18 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-
-  Future<void> _showLogoutProtection(BuildContext context) async {
-    final controller = TextEditingController();
+  Future<void> _showLogoutConfirmation(BuildContext context) async {
     return showDialog(
       context: context,
       builder: (context) => AlertDialog(
         backgroundColor: const Color(0xFF1A1A1A),
         title: const Text(
-          "Cerrar Sesión (Admin)",
+          "Cerrar Sesión",
           style: TextStyle(color: Colors.white),
         ),
-        content: TextField(
-          controller: controller,
-          obscureText: true,
-          style: const TextStyle(color: Colors.white),
-          decoration: const InputDecoration(
-            labelText: "Clave de Administrador",
-            labelStyle: TextStyle(color: Colors.white60),
-          ),
+        content: const Text(
+          "¿Estás seguro de que deseas cerrar sesión?",
+          style: TextStyle(color: Colors.white70),
         ),
         actions: [
           TextButton(
@@ -179,25 +266,84 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
           ElevatedButton(
             onPressed: () async {
-              if (controller.text == "ChrizDev073008") {
-                FlutterBackgroundService().invoke('stopService');
-                await _supabase.signOut();
+              FlutterBackgroundService().invoke('stopService');
+              await _db.signOut();
+              if (!mounted) return;
+              Navigator.pop(context);
+              Navigator.pushReplacement(
+                context,
+                MaterialPageRoute(builder: (context) => const LoginScreen()),
+              );
+            },
+            child: const Text("CERRAR SESIÓN"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showResetConfirmation(BuildContext context) async {
+    return showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A1A),
+        title: const Text(
+          "Borrar Registros",
+          style: TextStyle(color: Colors.white),
+        ),
+        content: const Text(
+          "Se borrarán todos tus registros de horas y pagos de forma permanente. Esta acción no se puede deshacer.",
+          style: TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("CANCELAR"),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () async {
+              await _db.deleteAllLogs();
+              if (!mounted) return;
+              Navigator.pop(context);
+              _loadData();
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text("Registros borrados")),
+              );
+            },
+            child: const Text("RESETEAR"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showHourlyRateSettings() async {
+    final rateController = TextEditingController(text: _customHourlyRate.toStringAsFixed(0));
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A1A),
+        title: const Text("Valor Hora de Trabajo", style: TextStyle(color: Colors.white)),
+        content: TextField(
+          controller: rateController,
+          keyboardType: TextInputType.number,
+          style: const TextStyle(color: Colors.white),
+          decoration: const InputDecoration(labelText: "Nuevo Valor por Hora", labelStyle: TextStyle(color: Colors.white60)),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("CANCELAR")),
+          ElevatedButton(
+            onPressed: () async {
+              final newRate = double.tryParse(rateController.text);
+              if (newRate != null) {
+                await _saveCustomRate(newRate);
                 if (!mounted) return;
                 Navigator.pop(context);
-                Navigator.pushReplacement(
-                  context,
-                  MaterialPageRoute(builder: (context) => const LoginScreen()),
-                );
-              } else {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text("Clave Incorrecta"),
-                    backgroundColor: Colors.red,
-                  ),
-                );
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Tarifa actualizada correctamente")));
               }
             },
-            child: const Text("AUTORIZAR"),
+            child: const Text("ACTUALIZAR"),
           ),
         ],
       ),
@@ -236,6 +382,18 @@ class _HomeScreenState extends State<HomeScreen> {
                       'EEEE, d MMM',
                       'es',
                     ).format(log.startTime);
+
+                    String detailStr = "";
+                    if (log.workMode == 'hours') {
+                      detailStr = "${DateFormat('hh:mm a').format(log.startTime)} - ${log.endTime != null ? DateFormat('hh:mm a').format(log.endTime!) : 'En curso'}\nPausa: ${log.breakDuration} min";
+                    } else if (log.workMode == 'shift_8') {
+                      detailStr = "Jornada de 8 Horas Fijas";
+                    } else if (log.workMode == 'shift_12') {
+                      detailStr = "Jornada de 12 Horas Fijas";
+                    } else {
+                      detailStr = "Jornada Personalizada: ${log.totalHours.toStringAsFixed(1)} Horas Fijas";
+                    }
+
                     return ListTile(
                       contentPadding: EdgeInsets.zero,
                       title: Text(
@@ -246,42 +404,42 @@ class _HomeScreenState extends State<HomeScreen> {
                         ),
                       ),
                       subtitle: Text(
-                        "${DateFormat('hh:mm a').format(log.startTime)} - ${log.endTime != null ? DateFormat('hh:mm a').format(log.endTime!) : 'En curso'}\nPausa: ${log.breakDuration} min",
+                        detailStr,
                         style: const TextStyle(
                           color: Colors.white54,
                           fontSize: 11,
                         ),
                       ),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              crossAxisAlignment: CrossAxisAlignment.end,
-                              children: [
-                                Text(
-                                  "${log.totalHours.toStringAsFixed(1)} h",
-                                  style: GoogleFonts.outfit(
-                                    color: AppConfig.primaryGreen,
-                                    fontWeight: FontWeight.bold,
-                                  ),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                              Text(
+                                "${log.totalHours.toStringAsFixed(1)} h",
+                                style: GoogleFonts.outfit(
+                                  color: AppConfig.primaryGreen,
+                                  fontWeight: FontWeight.bold,
                                 ),
-                                InkWell(
-                                  onTap: () => _confirmSinglePaymentDialog(log),
-                                  child: const Text("DÍA PAGO", style: TextStyle(color: AppConfig.gold, fontSize: 9, fontWeight: FontWeight.bold)),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(width: 10),
-                            IconButton(
-                              icon: const Icon(Icons.edit, color: Colors.white54, size: 20),
-                              onPressed: () {
-                                Navigator.pop(context);
-                                _showEditLogDialog(log);
-                              },
-                            ),
-                          ],
-                        ),
+                              ),
+                              InkWell(
+                                onTap: () => _confirmSinglePaymentDialog(log),
+                                child: const Text("DÍA PAGO", style: TextStyle(color: AppConfig.gold, fontSize: 9, fontWeight: FontWeight.bold)),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(width: 10),
+                          IconButton(
+                            icon: const Icon(Icons.edit, color: Colors.white54, size: 20),
+                            onPressed: () {
+                              Navigator.pop(context);
+                              _showEditLogDialog(log);
+                            },
+                          ),
+                        ],
+                      ),
                     );
                   },
                 ),
@@ -308,7 +466,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
               onPressed: () => _confirmPaymentDialog(),
               child: const Text(
-                "PROCEDER AL PAGO SEMANAL",
+                "PROCEDER AL PAGO",
                 style: TextStyle(fontSize: 10, color: Colors.white),
               ),
             ),
@@ -318,7 +476,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _showPaymentHistory() async {
-    final payments = await _supabase.getPaymentHistory();
+    final payments = await _db.getPaymentHistory();
     if (!mounted) return;
     showDialog(
       context: context,
@@ -399,7 +557,7 @@ class _HomeScreenState extends State<HomeScreen> {
           TextButton(onPressed: () => Navigator.pop(context), child: const Text("CANCELAR")),
           ElevatedButton(
             onPressed: () async {
-              await _supabase.recordSinglePayment(
+              await _db.recordSinglePayment(
                 logId: log.id!, 
                 amount: dayAmount, 
                 hours: log.totalHours, 
@@ -420,9 +578,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _confirmPaymentDialog() async {
     final notesController = TextEditingController();
-    final double totalPayableHours = _supabase.calculatePayableTotal(
-      _unpaidLogs,
-    );
+    final double totalPayableHours = _db.calculatePayableTotal(_unpaidLogs);
     final double totalAmount = totalPayableHours * _customHourlyRate;
 
     Navigator.pop(context);
@@ -431,7 +587,7 @@ class _HomeScreenState extends State<HomeScreen> {
       builder: (context) => AlertDialog(
         backgroundColor: const Color(0xFF1A1A1A),
         title: const Text(
-          "Finalizar Pago Semanal",
+          "Finalizar Pago",
           style: TextStyle(color: Colors.white),
         ),
         content: Column(
@@ -464,7 +620,7 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
           ElevatedButton(
             onPressed: () async {
-              await _supabase.recordPayment(
+              await _db.recordPayment(
                 logIds: _unpaidLogs.map((l) => l.id!).toList(),
                 amount: totalAmount,
                 hours: totalPayableHours,
@@ -486,72 +642,13 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Future<void> _showResetProtection(BuildContext context) async {
-    final controller = TextEditingController();
-    return showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF1A1A1A),
-        title: const Text(
-          "RESETEAR TODO (Admin)",
-          style: TextStyle(color: Colors.white),
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text(
-              "Se borrarán TODOS los registros de forma permanente.",
-              style: TextStyle(color: Colors.white70),
-            ),
-            const SizedBox(height: 15),
-            TextField(
-              controller: controller,
-              obscureText: true,
-              style: const TextStyle(color: Colors.white),
-              decoration: const InputDecoration(
-                labelText: "Clave Admin",
-                labelStyle: TextStyle(color: Colors.white60),
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text("CANCELAR"),
-          ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-            onPressed: () async {
-              if (controller.text == "ChrizDev073008") {
-                await _supabase.deleteAllLogs();
-                if (!mounted) return;
-                Navigator.pop(context);
-                _loadData();
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text("Registros borrados")),
-                );
-              } else {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text("Clave Incorrecta"),
-                    backgroundColor: Colors.red,
-                  ),
-                );
-              }
-            },
-            child: const Text("BORRAR"),
-          ),
-        ],
-      ),
-    );
-  }
-
   Future<void> _showEditLogDialog(WorkLog log) async {
     DateTime editDate = log.startTime;
     TimeOfDay editStart = TimeOfDay.fromDateTime(log.startTime);
-    TimeOfDay editEnd = TimeOfDay.fromDateTime(log.endTime!);
+    TimeOfDay editEnd = TimeOfDay.fromDateTime(log.endTime ?? log.startTime);
     final breakCtrl = TextEditingController(text: log.breakDuration.toString());
+    final hoursCtrl = TextEditingController(text: log.customHours?.toString() ?? "8.0");
+    String editMode = log.workMode;
 
     showDialog(
       context: context,
@@ -559,60 +656,103 @@ class _HomeScreenState extends State<HomeScreen> {
         builder: (context, setDialogState) => AlertDialog(
           backgroundColor: const Color(0xFF1A1A1A),
           title: const Text("Editar Jornada", style: TextStyle(color: Colors.white)),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              ListTile(
-                title: const Text("Fecha", style: TextStyle(color: Colors.white70)),
-                subtitle: Text(DateFormat('dd/MM/yyyy').format(editDate), style: const TextStyle(color: Colors.white)),
-                onTap: () async {
-                  final p = await showDatePicker(context: context, initialDate: editDate, firstDate: DateTime(2024), lastDate: DateTime.now());
-                  if (p != null) setDialogState(() => editDate = p);
-                },
-              ),
-              Row(
-                children: [
-                  Expanded(
-                    child: ListTile(
-                      title: const Text("Entrada", style: TextStyle(color: Colors.white70, fontSize: 12)),
-                      subtitle: Text(editStart.format(context), style: const TextStyle(color: Colors.white)),
-                      onTap: () async {
-                        final p = await showTimePicker(context: context, initialTime: editStart);
-                        if (p != null) setDialogState(() => editStart = p);
-                      },
-                    ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                DropdownButton<String>(
+                  dropdownColor: const Color(0xFF1A1A1A),
+                  value: editMode,
+                  style: const TextStyle(color: Colors.white),
+                  items: const [
+                    DropdownMenuItem(value: 'hours', child: Text("Por Horas")),
+                    DropdownMenuItem(value: 'shift_8', child: Text("Día 8 Horas")),
+                    DropdownMenuItem(value: 'shift_12', child: Text("Día 12 Horas")),
+                    DropdownMenuItem(value: 'custom', child: Text("Día Personalizado")),
+                  ],
+                  onChanged: (val) {
+                    if (val != null) setDialogState(() => editMode = val);
+                  },
+                ),
+                const SizedBox(height: 10),
+                ListTile(
+                  title: const Text("Fecha", style: TextStyle(color: Colors.white70, fontSize: 12)),
+                  subtitle: Text(DateFormat('dd/MM/yyyy').format(editDate), style: const TextStyle(color: Colors.white)),
+                  onTap: () async {
+                    final p = await showDatePicker(context: context, initialDate: editDate, firstDate: DateTime(2024), lastDate: DateTime.now());
+                    if (p != null) setDialogState(() => editDate = p);
+                  },
+                ),
+                if (editMode == 'hours') ...[
+                  Row(
+                    children: [
+                      Expanded(
+                        child: ListTile(
+                          title: const Text("Entrada", style: TextStyle(color: Colors.white70, fontSize: 12)),
+                          subtitle: Text(editStart.format(context), style: const TextStyle(color: Colors.white)),
+                          onTap: () async {
+                            final p = await showTimePicker(context: context, initialTime: editStart);
+                            if (p != null) setDialogState(() => editStart = p);
+                          },
+                        ),
+                      ),
+                      Expanded(
+                        child: ListTile(
+                          title: const Text("Salida", style: TextStyle(color: Colors.white70, fontSize: 12)),
+                          subtitle: Text(editEnd.format(context), style: const TextStyle(color: Colors.white)),
+                          onTap: () async {
+                            final p = await showTimePicker(context: context, initialTime: editEnd);
+                            if (p != null) setDialogState(() => editEnd = p);
+                          },
+                        ),
+                      ),
+                    ],
                   ),
-                  Expanded(
-                    child: ListTile(
-                      title: const Text("Salida", style: TextStyle(color: Colors.white70, fontSize: 12)),
-                      subtitle: Text(editEnd.format(context), style: const TextStyle(color: Colors.white)),
-                      onTap: () async {
-                        final p = await showTimePicker(context: context, initialTime: editEnd);
-                        if (p != null) setDialogState(() => editEnd = p);
-                      },
-                    ),
+                  TextField(
+                    controller: breakCtrl,
+                    keyboardType: TextInputType.number,
+                    style: const TextStyle(color: Colors.white),
+                    decoration: const InputDecoration(labelText: "Pausa (min)", labelStyle: TextStyle(color: Colors.white54)),
+                  ),
+                ] else if (editMode == 'custom') ...[
+                  TextField(
+                    controller: hoursCtrl,
+                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                    style: const TextStyle(color: Colors.white),
+                    decoration: const InputDecoration(labelText: "Horas de la Jornada", labelStyle: TextStyle(color: Colors.white54)),
                   ),
                 ],
-              ),
-              TextField(
-                controller: breakCtrl,
-                keyboardType: TextInputType.number,
-                style: const TextStyle(color: Colors.white),
-                decoration: const InputDecoration(labelText: "Pausa (min)", labelStyle: TextStyle(color: Colors.white54)),
-              ),
-            ],
+              ],
+            ),
           ),
           actions: [
             TextButton(onPressed: () => Navigator.pop(context), child: const Text("CANCELAR")),
             ElevatedButton(
               onPressed: () async {
                 final start = DateTime(editDate.year, editDate.month, editDate.day, editStart.hour, editStart.minute);
-                final end = DateTime(editDate.year, editDate.month, editDate.day, editEnd.hour, editEnd.minute);
-                await _supabase.updateWorkLog(
+                DateTime end;
+                double? customH;
+                int breakM = 0;
+
+                if (editMode == 'hours') {
+                  end = DateTime(editDate.year, editDate.month, editDate.day, editEnd.hour, editEnd.minute);
+                  breakM = int.tryParse(breakCtrl.text) ?? 0;
+                } else if (editMode == 'shift_8') {
+                  end = start.add(const Duration(hours: 8));
+                } else if (editMode == 'shift_12') {
+                  end = start.add(const Duration(hours: 12));
+                } else {
+                  customH = double.tryParse(hoursCtrl.text) ?? 8.0;
+                  end = start.add(Duration(minutes: (customH * 60).toInt()));
+                }
+
+                await _db.updateWorkLog(
                   logId: log.id!,
                   startTime: start,
                   endTime: end,
-                  breakDuration: int.tryParse(breakCtrl.text) ?? 0,
+                  breakDuration: breakM,
+                  workMode: editMode,
+                  customHours: customH,
                 );
                 if (!mounted) return;
                 Navigator.pop(context);
@@ -626,81 +766,15 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Future<void> _showAdminSettings() async {
-    final controller = TextEditingController();
-    final rateController = TextEditingController(text: _customHourlyRate.toStringAsFixed(0));
-    
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF1A1A1A),
-        title: const Text("Ajustes de Administrador", style: TextStyle(color: Colors.white)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: controller,
-              obscureText: true,
-              style: const TextStyle(color: Colors.white),
-              decoration: const InputDecoration(labelText: "Clave Admin", labelStyle: TextStyle(color: Colors.white60)),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("CANCELAR")),
-          ElevatedButton(
-            onPressed: () {
-              if (controller.text == "ChrizDev073008") {
-                Navigator.pop(context);
-                showDialog(
-                  context: context,
-                  builder: (context) => AlertDialog(
-                    backgroundColor: const Color(0xFF1A1A1B),
-                    title: const Text("Valor Hora de Trabajo", style: TextStyle(color: Colors.white)),
-                    content: TextField(
-                      controller: rateController,
-                      keyboardType: TextInputType.number,
-                      style: const TextStyle(color: Colors.white),
-                      decoration: const InputDecoration(labelText: "Nuevo Valor por Hora", labelStyle: TextStyle(color: Colors.white60)),
-                    ),
-                    actions: [
-                      TextButton(onPressed: () => Navigator.pop(context), child: const Text("CANCELAR")),
-                      ElevatedButton(
-                        onPressed: () async {
-                          final newRate = double.tryParse(rateController.text);
-                          if (newRate != null) {
-                            await _saveCustomRate(newRate);
-                            if (!mounted) return;
-                            Navigator.pop(context);
-                            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Tarifa actualizada correctamente")));
-                          }
-                        },
-                        child: const Text("ACTUALIZAR"),
-                      ),
-                    ],
-                  ),
-                );
-              } else {
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Clave Incorrecta"), backgroundColor: Colors.red));
-              }
-            },
-            child: const Text("AUTORIZAR"),
-          ),
-        ],
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
-    double totalPayableHours = _supabase.calculatePayableTotal(_unpaidLogs);
+    double totalPayableHours = _db.calculatePayableTotal(_unpaidLogs);
     final currencyFormatter = NumberFormat.currency(
       locale: 'es_CO',
       symbol: '\$',
       decimalDigits: 0,
     );
     
-    // Stats calculation
     double weeklyTotal = 0;
     final now = DateTime.now();
     final startOfWeek = now.subtract(Duration(days: now.weekday - 1));
@@ -723,18 +797,19 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
         leading: IconButton(
           icon: const Icon(Icons.logout),
-          onPressed: () => _showLogoutProtection(context),
+          onPressed: () => _showLogoutConfirmation(context),
+          tooltip: "Cerrar Sesión",
         ),
         actions: [
           IconButton(
             icon: const Icon(Icons.settings, color: Colors.blueAccent),
-            onPressed: _showAdminSettings,
-            tooltip: "Ajustes de Admin",
+            onPressed: _showHourlyRateSettings,
+            tooltip: "Ajustes de Tarifa",
           ),
           IconButton(
             icon: const Icon(Icons.delete_sweep, color: Colors.redAccent),
-            onPressed: () => _showResetProtection(context),
-            tooltip: "Resetear Horas (Admin)",
+            onPressed: () => _showResetConfirmation(context),
+            tooltip: "Resetear Horas",
           ),
           IconButton(icon: const Icon(Icons.refresh), onPressed: _loadData),
         ],
@@ -750,11 +825,18 @@ class _HomeScreenState extends State<HomeScreen> {
                 const SizedBox(height: 25),
                 _buildStatsCard(weeklyTotal, currencyFormatter),
                 const SizedBox(height: 20),
+                _buildRealTimeShiftCard(),
+                const SizedBox(height: 20),
                 _buildManualInputPanel(),
                 const SizedBox(height: 20),
                 _buildSummaryCard(totalPayableHours, currencyFormatter),
                 const SizedBox(height: 20),
+                _buildSocialBenefitsCard(totalPayableHours * _customHourlyRate, currencyFormatter),
+                const SizedBox(height: 20),
                 _buildActions(),
+                const SizedBox(height: 40),
+                _buildDeveloperSignature(),
+                const SizedBox(height: 20),
               ],
             ),
     );
@@ -801,7 +883,7 @@ class _HomeScreenState extends State<HomeScreen> {
           style: GoogleFonts.outfit(fontSize: 16, color: Colors.white70),
         ),
         Text(
-          _supabase.currentUserName,
+          _db.currentUserName,
           style: GoogleFonts.outfit(
             fontSize: 28,
             fontWeight: FontWeight.bold,
@@ -812,8 +894,161 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildClockSection() {
-    return _buildManualInputPanel();
+  Widget _buildRealTimeShiftCard() {
+    final bool hasActive = _activeShift != null;
+    
+    return Container(
+      padding: const EdgeInsets.all(25),
+      decoration: BoxDecoration(
+        color: hasActive ? AppConfig.primaryGreen.withOpacity(0.05) : Colors.white.withOpacity(0.02),
+        borderRadius: BorderRadius.circular(35),
+        border: Border.all(
+          color: hasActive ? AppConfig.primaryGreen.withOpacity(0.3) : Colors.white.withOpacity(0.05),
+        ),
+      ),
+      child: Column(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                "CRONÓMETRO DE JORNADA",
+                style: GoogleFonts.outfit(
+                  color: hasActive ? AppConfig.primaryGreen : Colors.white54,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 2,
+                  fontSize: 13,
+                ),
+              ),
+              if (hasActive)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: _isOnBreak ? AppConfig.gold.withOpacity(0.2) : AppConfig.primaryGreen.withOpacity(0.2),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Text(
+                    _isOnBreak ? "EN PAUSA" : "ACTIVO",
+                    style: TextStyle(
+                      color: _isOnBreak ? AppConfig.gold : AppConfig.primaryGreen,
+                      fontSize: 10,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 20),
+          if (!hasActive) ...[
+            const Icon(Icons.timer_outlined, color: Colors.white24, size: 50),
+            const SizedBox(height: 15),
+            const Text(
+              "¿Comienzas a trabajar ahora?",
+              style: TextStyle(color: Colors.white70, fontWeight: FontWeight.w500),
+            ),
+            const SizedBox(height: 5),
+            const Text(
+              "Inicia tu cronómetro para calcular tus horas automáticamente en segundo plano.",
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.white30, fontSize: 11),
+            ),
+            const SizedBox(height: 20),
+            SizedBox(
+              width: double.infinity,
+              height: 50,
+              child: ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppConfig.primaryGreen,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+                ),
+                onPressed: () async {
+                  setState(() => _isLoading = true);
+                  await _db.startShift();
+                  await _checkActiveShift();
+                  setState(() => _isLoading = false);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text("Jornada iniciada")),
+                  );
+                },
+                icon: const Icon(Icons.play_arrow, color: Colors.white),
+                label: const Text("INICIAR JORNADA", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
+              ),
+            ),
+          ] else ...[
+            Text(
+              _formatDuration(_elapsedTime),
+              style: GoogleFonts.outfit(
+                fontSize: 40,
+                fontWeight: FontWeight.bold,
+                color: Colors.white,
+                letterSpacing: 2,
+              ),
+            ),
+            const SizedBox(height: 5),
+            Text(
+              "Inicio: ${DateFormat('hh:mm a').format(_activeShift!.startTime)}",
+              style: const TextStyle(color: Colors.white38, fontSize: 12),
+            ),
+            const SizedBox(height: 25),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: _isOnBreak ? AppConfig.primaryGreen : AppConfig.gold,
+                      side: BorderSide(color: _isOnBreak ? AppConfig.primaryGreen : AppConfig.gold),
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+                    ),
+                    onPressed: () async {
+                      await _db.togglePause(_activeShift!.id!, !_isOnBreak);
+                      await _checkActiveShift();
+                    },
+                    icon: Icon(_isOnBreak ? Icons.play_arrow : Icons.pause),
+                    label: Text(
+                      _isOnBreak ? "REANUDAR" : "ALMUERZO",
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 15),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.redAccent,
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+                    ),
+                    onPressed: () async {
+                      setState(() => _isLoading = true);
+                      await _db.endShift(_activeShift!.id!, _activeShift!.startTime);
+                      await _checkActiveShift();
+                      _loadData();
+                      setState(() => _isLoading = false);
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text("Jornada finalizada y guardada")),
+                      );
+                    },
+                    icon: const Icon(Icons.stop, color: Colors.white),
+                    label: const Text(
+                      "TERMINAR",
+                      style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white, fontSize: 11),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  String _formatDuration(Duration d) {
+    final hours = d.inHours.toString().padLeft(2, '0');
+    final minutes = (d.inMinutes % 60).toString().padLeft(2, '0');
+    final seconds = (d.inSeconds % 60).toString().padLeft(2, '0');
+    return "$hours:$minutes:$seconds";
   }
 
   Widget _buildManualInputPanel() {
@@ -830,6 +1065,24 @@ class _HomeScreenState extends State<HomeScreen> {
             style: GoogleFonts.outfit(color: AppConfig.primaryGreen, fontWeight: FontWeight.bold, letterSpacing: 2, fontSize: 13)),
           const SizedBox(height: 25),
           
+          // MÓDULO DE MODOS DE JORNADA
+          Container(
+            margin: const EdgeInsets.only(bottom: 20),
+            padding: const EdgeInsets.all(5),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.05),
+              borderRadius: BorderRadius.circular(15),
+            ),
+            child: Row(
+              children: [
+                _modeButton('hours', 'Por Horas'),
+                _modeButton('shift_8', 'Día 8h'),
+                _modeButton('shift_12', 'Día 12h'),
+                _modeButton('custom', 'Personaliz.'),
+              ],
+            ),
+          ),
+          
           _inputTile(
             icon: Icons.calendar_today,
             label: "Fecha de la Jornada",
@@ -838,42 +1091,80 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
           const SizedBox(height: 15),
           
-          Row(
-            children: [
-              Expanded(
-                child: _inputTile(
-                  icon: Icons.login,
-                  label: "Hora Entrada",
-                  value: _startTime.format(context),
-                  onTap: () => _selectTime(true),
+          if (_workMode == 'hours') ...[
+            Row(
+              children: [
+                Expanded(
+                  child: _inputTile(
+                    icon: Icons.login,
+                    label: "Hora Entrada",
+                    value: _startTime.format(context),
+                    onTap: () => _selectTime(true),
+                  ),
                 ),
-              ),
-              const SizedBox(width: 15),
-              Expanded(
-                child: _inputTile(
-                  icon: Icons.logout,
-                  label: "Hora Salida",
-                  value: _endTime.format(context),
-                  onTap: () => _selectTime(false),
+                const SizedBox(width: 15),
+                Expanded(
+                  child: _inputTile(
+                    icon: Icons.logout,
+                    label: "Hora Salida",
+                    value: _endTime.format(context),
+                    onTap: () => _selectTime(false),
+                  ),
                 ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 20),
-          
-          TextField(
-            controller: _breakController,
-            keyboardType: TextInputType.number,
-            style: const TextStyle(color: Colors.white),
-            decoration: InputDecoration(
-              prefixIcon: const Icon(Icons.lunch_dining, color: AppConfig.gold),
-              labelText: "Minutos de Almuerzo",
-              labelStyle: const TextStyle(color: Colors.white54, fontSize: 12),
-              filled: true,
-              fillColor: Colors.white.withOpacity(0.05),
-              border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none),
+              ],
             ),
-          ),
+            const SizedBox(height: 20),
+            TextField(
+              controller: _breakController,
+              keyboardType: TextInputType.number,
+              style: const TextStyle(color: Colors.white),
+              decoration: InputDecoration(
+                prefixIcon: const Icon(Icons.lunch_dining, color: AppConfig.gold),
+                labelText: "Minutos de Almuerzo",
+                labelStyle: const TextStyle(color: Colors.white54, fontSize: 12),
+                filled: true,
+                fillColor: Colors.white.withOpacity(0.05),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none),
+              ),
+            ),
+          ] else if (_workMode == 'custom') ...[
+            TextField(
+              controller: _customHoursController,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              style: const TextStyle(color: Colors.white),
+              decoration: InputDecoration(
+                prefixIcon: const Icon(Icons.hourglass_bottom, color: AppConfig.primaryGreen),
+                labelText: "Horas de la Jornada Fija",
+                labelStyle: const TextStyle(color: Colors.white54, fontSize: 12),
+                filled: true,
+                fillColor: Colors.white.withOpacity(0.05),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none),
+              ),
+            ),
+          ] else ...[
+            Container(
+              padding: const EdgeInsets.all(15),
+              decoration: BoxDecoration(
+                color: AppConfig.primaryGreen.withOpacity(0.05),
+                borderRadius: BorderRadius.circular(15),
+                border: Border.all(color: AppConfig.primaryGreen.withOpacity(0.1)),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.check_circle_outline, color: AppConfig.primaryGreen),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      _workMode == 'shift_8' 
+                          ? "Se registrará una jornada plana de 8.0 horas." 
+                          : "Se registrará una jornada plana de 12.0 horas.",
+                      style: const TextStyle(color: Colors.white70, fontSize: 11),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
           
           const SizedBox(height: 30),
           
@@ -886,10 +1177,40 @@ class _HomeScreenState extends State<HomeScreen> {
                 backgroundColor: AppConfig.primaryGreen,
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
               ),
-              child: const Text("GUARDAR JORNADA", style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1)),
+              child: const Text("GUARDAR JORNADA", style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1, color: Colors.white)),
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _modeButton(String mode, String label) {
+    final isSelected = _workMode == mode;
+    return Expanded(
+      child: InkWell(
+        onTap: () {
+          setState(() {
+            _workMode = mode;
+          });
+        },
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          decoration: BoxDecoration(
+            color: isSelected ? AppConfig.primaryGreen : Colors.transparent,
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Text(
+            label,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: isSelected ? Colors.white : Colors.white54,
+              fontSize: 10,
+              fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -949,14 +1270,14 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ),
               const SizedBox(height: 5),
-                Text(
-                  formatter.format(hours * _customHourlyRate),
-                  style: GoogleFonts.outfit(
-                    fontSize: 26,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.white,
-                  ),
+              Text(
+                formatter.format(hours * _customHourlyRate),
+                style: GoogleFonts.outfit(
+                  fontSize: 26,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
                 ),
+              ),
               const SizedBox(height: 5),
               Text(
                 DateTime.now().weekday == DateTime.saturday
@@ -999,6 +1320,115 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Widget _buildSocialBenefitsCard(double baseSalary, NumberFormat formatter) {
+    final prima = baseSalary * 0.0833;
+    final cesantias = baseSalary * 0.0833;
+    final intereses = cesantias * 0.12;
+    final vacaciones = baseSalary * 0.0417;
+    final totalPrestaciones = prima + cesantias + intereses + vacaciones;
+    final totalConPrestaciones = baseSalary + totalPrestaciones;
+
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.02),
+        borderRadius: BorderRadius.circular(25),
+        border: Border.all(color: Colors.white.withOpacity(0.05)),
+      ),
+      child: Theme(
+        data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          iconColor: AppConfig.primaryGreen,
+          collapsedIconColor: Colors.white54,
+          title: Row(
+            children: [
+              const Icon(Icons.account_balance_wallet_outlined, color: AppConfig.primaryGreen, size: 20),
+              const SizedBox(width: 10),
+              Text(
+                "Prestaciones Sociales (Colombia)",
+                style: GoogleFonts.outfit(
+                  fontSize: 13,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
+              ),
+            ],
+          ),
+          subtitle: Text(
+            "Acumulado estimado: +${formatter.format(totalPrestaciones)}",
+            style: const TextStyle(color: Colors.white38, fontSize: 11),
+          ),
+          children: [
+            Padding(
+              padding: const EdgeInsets.only(left: 20, right: 20, bottom: 20),
+              child: Column(
+                children: [
+                  const Divider(color: Colors.white10),
+                  const SizedBox(height: 10),
+                  _benefitRow("Prima de Servicios (8.33%)", prima, formatter),
+                  const SizedBox(height: 8),
+                  _benefitRow("Cesantías (8.33%)", cesantias, formatter),
+                  const SizedBox(height: 8),
+                  _benefitRow("Intereses sobre Cesantías (1.00%)", intereses, formatter),
+                  const SizedBox(height: 8),
+                  _benefitRow("Vacaciones (4.17%)", vacaciones, formatter),
+                  const Padding(
+                     padding: EdgeInsets.symmetric(vertical: 10),
+                     child: Divider(color: Colors.white10),
+                  ),
+                  _benefitRow(
+                    "Total Prestaciones (21.83%)", 
+                    totalPrestaciones, 
+                    formatter, 
+                    isTotal: true, 
+                    color: AppConfig.gold
+                  ),
+                  const SizedBox(height: 8),
+                  _benefitRow(
+                    "Total Neto + Prestaciones", 
+                    totalConPrestaciones, 
+                    formatter, 
+                    isTotal: true, 
+                    color: AppConfig.primaryGreen
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    "Nota: Estimaciones proporcionales según la legislación colombiana vigente. Pueden cambiar según las condiciones del contrato.",
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.white24, fontSize: 9, fontStyle: FontStyle.italic),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _benefitRow(String label, double value, NumberFormat formatter, {bool isTotal = false, Color? color}) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(
+          label,
+          style: TextStyle(
+            color: isTotal ? Colors.white : Colors.white70,
+            fontSize: isTotal ? 12 : 11,
+            fontWeight: isTotal ? FontWeight.bold : FontWeight.normal,
+          ),
+        ),
+        Text(
+          formatter.format(value),
+          style: TextStyle(
+            color: color ?? (isTotal ? Colors.white : Colors.white),
+            fontSize: isTotal ? 13 : 11,
+            fontWeight: isTotal ? FontWeight.bold : FontWeight.w600,
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildActions() {
     return Column(
       children: [
@@ -1019,7 +1449,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 label: "Reporte PDF",
                 onTap: () => PdfService.generateAndShareReport(
                   _unpaidLogs,
-                  _supabase.calculatePayableTotal(_unpaidLogs),
+                  _db.calculatePayableTotal(_unpaidLogs),
                   _customHourlyRate,
                 ),
                 color: AppConfig.gold.withOpacity(0.8),
@@ -1060,9 +1490,9 @@ class _HomeScreenState extends State<HomeScreen> {
         backgroundColor: const Color(0xFF1A1A1A),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25)),
         title: Text("✨ Suscripción Premium", style: GoogleFonts.outfit(color: AppConfig.gold, fontWeight: FontWeight.bold)),
-        content: Text(
+        content: const Text(
           "Si estás interesado en adquirir una cuenta en la App de Gestión de ChrizDev, tiene un costo de \$30.000 pesos semanales.\n\nEsto cubre costos de servidor y despliegue, pero si quieres estar al día en tus cuentas sin sentir que pierdes dinero, ¡lo vale!",
-          style: const TextStyle(color: Colors.white70, fontSize: 14),
+          style: TextStyle(color: Colors.white70, fontSize: 14),
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context), child: const Text("LUEGO")),
@@ -1124,6 +1554,28 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDeveloperSignature() {
+    return Center(
+      child: GestureDetector(
+        onTap: () async {
+          final url = "https://christian-romero.vercel.app/index.html";
+          if (await canLaunchUrl(Uri.parse(url))) {
+            await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+          }
+        },
+        child: Text(
+          "Desarrollado por ChrizDev",
+          style: GoogleFonts.outfit(
+            color: Colors.white30,
+            fontSize: 12,
+            decoration: TextDecoration.underline,
+            letterSpacing: 1,
+          ),
         ),
       ),
     );
